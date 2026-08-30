@@ -1,0 +1,293 @@
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync } from "node:fs";
+import { dirname, delimiter, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { TSchema } from "typebox";
+
+const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+
+interface ToolDescriptor {
+	name: string;
+	description: string;
+	parameters: Record<string, unknown>;
+	source: "assistant" | "device";
+	tool_type: "read" | "write" | "generic" | "think";
+	mutates_state: boolean;
+}
+
+interface LoadedTask {
+	task_id: string;
+	ticket: string;
+	policy_type: "workflow";
+	tool_count: number;
+}
+
+interface ToolCallResult {
+	content: string;
+	error: boolean;
+	task_id: string;
+	tool_name: string;
+}
+
+interface BridgeStatus {
+	task_id: string | null;
+	loaded: boolean;
+	policy_type: "workflow";
+	tool_count: number;
+}
+
+interface BridgeEnvelope {
+	id: number;
+	ok: boolean;
+	result?: unknown;
+	error?: string;
+}
+
+interface PendingRequest {
+	resolve: (value: unknown) => void;
+	reject: (reason: Error) => void;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function labelFor(name: string): string {
+	return name
+		.split("_")
+		.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+		.join(" ");
+}
+
+class TelecomBridgeClient {
+	private readonly cwd: string;
+	private process: ChildProcessWithoutNullStreams | undefined;
+	private stdoutBuffer = "";
+	private stderrBuffer = "";
+	private nextRequestId = 1;
+	private pending = new Map<number, PendingRequest>();
+	private requestQueue: Promise<void> = Promise.resolve();
+
+	constructor(cwd: string) {
+		this.cwd = cwd;
+	}
+
+	private start(): ChildProcessWithoutNullStreams {
+		if (this.process !== undefined) return this.process;
+
+		const configuredPython = process.env.TAU2_PI_PYTHON?.trim();
+		const projectPython = join(this.cwd, ".venv", "bin", "python");
+		const python =
+			configuredPython || (existsSync(projectPython) ? projectPython : "python");
+		const sourcePath = join(this.cwd, "src");
+		const pythonPath = process.env.PYTHONPATH;
+		const child = spawn(python, ["-m", "tau2.domains.telecom.pi_bridge"], {
+			cwd: this.cwd,
+			env: {
+				...process.env,
+				PYTHONPATH: pythonPath ? `${sourcePath}${delimiter}${pythonPath}` : sourcePath,
+			},
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		this.process = child;
+
+		child.stdout.setEncoding("utf8");
+		child.stdout.on("data", (chunk: string) => this.consumeStdout(chunk));
+		child.stderr.setEncoding("utf8");
+		child.stderr.on("data", (chunk: string) => {
+			this.stderrBuffer = `${this.stderrBuffer}${chunk}`.slice(-8000);
+		});
+		child.on("error", (error) => this.rejectAll(error));
+		child.on("exit", (code, signal) => {
+			const diagnostic = this.stderrBuffer.trim();
+			const suffix = diagnostic ? `\n${diagnostic}` : "";
+			this.rejectAll(
+				new Error(
+					`tau2 Telecom bridge exited (${code ?? signal ?? "unknown"})${suffix}`,
+				),
+			);
+			this.process = undefined;
+		});
+		return child;
+	}
+
+	private consumeStdout(chunk: string): void {
+		this.stdoutBuffer += chunk;
+		for (;;) {
+			const newline = this.stdoutBuffer.indexOf("\n");
+			if (newline < 0) return;
+			const line = this.stdoutBuffer.slice(0, newline).trim();
+			this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
+			if (!line) continue;
+
+			let envelope: BridgeEnvelope;
+			try {
+				envelope = JSON.parse(line) as BridgeEnvelope;
+			} catch {
+				this.rejectAll(new Error(`Invalid JSON from tau2 Telecom bridge: ${line}`));
+				continue;
+			}
+			const pending = this.pending.get(envelope.id);
+			if (pending === undefined) continue;
+			this.pending.delete(envelope.id);
+			if (envelope.ok) pending.resolve(envelope.result);
+			else {
+				pending.reject(
+					new Error(envelope.error || "Unknown tau2 Telecom bridge error"),
+				);
+			}
+		}
+	}
+
+	private rejectAll(error: Error): void {
+		for (const pending of this.pending.values()) pending.reject(error);
+		this.pending.clear();
+	}
+
+	private requestNow<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+		const child = this.start();
+		const id = this.nextRequestId++;
+		return new Promise<T>((resolve, reject) => {
+			this.pending.set(id, {
+				resolve: (value) => resolve(value as T),
+				reject,
+			});
+			child.stdin.write(`${JSON.stringify({ id, method, params })}\n`, (error) => {
+				if (error === null || error === undefined) return;
+				this.pending.delete(id);
+				reject(error);
+			});
+		});
+	}
+
+	request<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+		const result = this.requestQueue.then(() => this.requestNow<T>(method, params));
+		this.requestQueue = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	}
+
+	stop(): void {
+		const child = this.process;
+		this.process = undefined;
+		if (child !== undefined && !child.killed) child.kill();
+		this.rejectAll(new Error("tau2 Telecom bridge stopped"));
+	}
+}
+
+export default function tau2TelecomExtension(pi: ExtensionAPI) {
+	let client: TelecomBridgeClient | undefined;
+	let toolDescriptors: ToolDescriptor[] = [];
+	const registeredNames = new Set<string>();
+
+	const getClient = (): TelecomBridgeClient => {
+		client ??= new TelecomBridgeClient(PROJECT_ROOT);
+		return client;
+	};
+
+	const registerTelecomTools = async (): Promise<void> => {
+		if (toolDescriptors.length === 0) {
+			toolDescriptors = await getClient().request<ToolDescriptor[]>("describe_tools");
+		}
+		for (const descriptor of toolDescriptors) {
+			if (registeredNames.has(descriptor.name)) continue;
+			registeredNames.add(descriptor.name);
+			pi.registerTool({
+				name: descriptor.name,
+				label: labelFor(descriptor.name),
+				description: descriptor.description,
+				parameters: descriptor.parameters as TSchema,
+				executionMode: "sequential",
+				async execute(toolCallId, params, signal) {
+					if (signal?.aborted) {
+						return {
+							content: [{ type: "text", text: "Cancelled" }],
+							details: { cancelled: true },
+						};
+					}
+					const argumentsObject = isRecord(params) ? params : {};
+					const result = await getClient().request<ToolCallResult>("call_tool", {
+						tool_call_id: toolCallId,
+						tool_name: descriptor.name,
+						arguments: argumentsObject,
+					});
+					return {
+						content: [{ type: "text", text: result.content }],
+						details: {
+							error: result.error,
+							source: descriptor.source,
+							toolType: descriptor.tool_type,
+							mutatesState: descriptor.mutates_state,
+							taskId: result.task_id,
+						},
+					};
+				},
+			});
+		}
+	};
+
+	pi.on("session_start", async (_event, ctx) => {
+		try {
+			await registerTelecomTools();
+			ctx.ui.notify(`Registered ${toolDescriptors.length} tau2 Telecom tools`, "info");
+		} catch (error) {
+			ctx.ui.notify(`Failed to start tau2 Telecom bridge: ${String(error)}`, "error");
+		}
+	});
+
+	pi.on("session_shutdown", async () => {
+		client?.stop();
+		client = undefined;
+		toolDescriptors = [];
+		registeredNames.clear();
+	});
+
+	pi.registerCommand("telecom-task", {
+		description: "Load a tau2 Telecom solo task: /telecom-task <task-id>",
+		handler: async (args, ctx) => {
+			const taskId = args.trim();
+			if (!taskId) {
+				ctx.ui.notify("Usage: /telecom-task <task-id>", "warning");
+				return;
+			}
+			try {
+				await registerTelecomTools();
+				const loaded = await getClient().request<LoadedTask>("load_task", {
+					task_id: taskId,
+				});
+				const availableNames = new Set(pi.getAllTools().map((tool) => tool.name));
+				const activeNames = toolDescriptors.map((tool) => tool.name).filter((name) =>
+					availableNames.has(name),
+				);
+				pi.setActiveTools(activeNames);
+				pi.setSessionName(`telecom ${loaded.task_id}`);
+				pi.sendUserMessage(
+					`/skill:telecom-solo-support Task ID: ${loaded.task_id}\n` +
+						`Policy mode: ${loaded.policy_type}\n\n${loaded.ticket}`,
+					{ expandPromptTemplates: true },
+				);
+			} catch (error) {
+				ctx.ui.notify(`Failed to load Telecom task: ${String(error)}`, "error");
+			}
+		},
+	});
+
+	pi.registerCommand("telecom-status", {
+		description: "Show the active tau2 Telecom bridge task",
+		handler: async (_args, ctx) => {
+			try {
+				const status = await getClient().request<BridgeStatus>("status");
+				const task = status.task_id ?? "none";
+				ctx.ui.notify(
+					`Telecom task: ${task}; policy: ${status.policy_type}; tools: ${status.tool_count}`,
+					status.loaded ? "info" : "warning",
+				);
+			} catch (error) {
+				ctx.ui.notify(`Failed to query Telecom bridge: ${String(error)}`, "error");
+			}
+		},
+	});
+}
