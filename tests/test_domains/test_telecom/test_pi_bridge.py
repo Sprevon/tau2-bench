@@ -43,3 +43,53 @@ def test_bridge_requires_task_before_tool_call() -> None:
 
     with pytest.raises(ValueError, match="/telecom-task"):
         bridge.call_tool("test-call", "check_status_bar", {})
+
+
+def test_bridge_requires_task_before_evaluate() -> None:
+    bridge = TelecomPiBridge()
+
+    with pytest.raises(ValueError, match="/telecom-task"):
+        bridge.evaluate()
+
+
+def test_bridge_lists_small_split() -> None:
+    bridge = TelecomPiBridge()
+
+    listed = bridge.list_tasks(split="small")
+
+    assert listed["split"] == "small"
+    assert listed["count"] == 20
+    assert listed["task_ids"][0] == get_tasks("small")[0].id
+
+
+def test_bridge_evaluate_records_read_tool_and_scores_unsolved_task() -> None:
+    bridge = TelecomPiBridge()
+    task = get_tasks("small")[0]
+
+    bridge.load_task(task.id)
+    bridge.call_tool("test-call", "check_status_bar", {})
+    result = bridge.evaluate()
+
+    assert result["task_id"] == task.id
+    assert result["n_tool_calls"] == 1
+    assert result["n_tool_errors"] == 0
+    assert result["tool_calls"][0]["tool_name"] == "check_status_bar"
+    assert result["reward"] == 0.0
+    assert result["reward_basis"] == ["ENV_ASSERTION"]
+    assert any(not item["met"] for item in result["env_assertions"])
+
+
+def test_bridge_evaluate_passes_after_golden_actions() -> None:
+    bridge = TelecomPiBridge()
+    task = get_tasks("small")[0]
+    actions = task.evaluation_criteria.actions or []
+    assert actions, "small[0] should have a reference action list"
+
+    bridge.load_task(task.id)
+    for index, action in enumerate(actions):
+        result = bridge.call_tool(f"gold-{index}", action.name, action.arguments)
+        assert result["error"] is False, result["content"]
+
+    scored = bridge.evaluate()
+    assert scored["reward"] == 1.0
+    assert all(item["met"] for item in scored["env_assertions"])

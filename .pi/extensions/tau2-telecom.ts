@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -261,16 +261,73 @@ export default function tau2TelecomExtension(pi: ExtensionAPI) {
 		}
 	};
 
+	const loadTelecomTask = async (
+		taskId: string,
+		ctx: { ui: { notify: (message: string, type?: "info" | "warning" | "error") => void } },
+		options: { sendPrompt: boolean },
+	): Promise<LoadedTask> => {
+		await registerTelecomTools();
+		const loaded = await getClient().request<LoadedTask>("load_task", {
+			task_id: taskId,
+		});
+		const availableNames = new Set(pi.getAllTools().map((tool) => tool.name));
+		const selectedNames = selectToolNamesForTask(loaded.task_id, toolDescriptors);
+		const activeNames = selectedNames.filter((name) => availableNames.has(name));
+		if (activeNames.length !== selectedNames.length) {
+			const missingNames = selectedNames.filter((name) => !availableNames.has(name));
+			throw new Error(
+				`Selected Telecom tools are not registered: ${missingNames.join(", ")}`,
+			);
+		}
+		pi.setActiveTools(activeNames);
+		ctx.ui.notify(
+			`Activated ${activeNames.length}/${toolDescriptors.length} tau2 Telecom tools`,
+			"info",
+		);
+		pi.setSessionName(`telecom ${loaded.task_id}`);
+		if (options.sendPrompt) {
+			pi.sendUserMessage(
+				`/skill:telecom-solo-support Task ID: ${loaded.task_id}\n` +
+					`Policy mode: ${loaded.policy_type}\n\n${loaded.ticket}`,
+				{ expandPromptTemplates: true },
+			);
+		}
+		return loaded;
+	};
+
+	const writeEvaluation = async (): Promise<void> => {
+		const evalOut = process.env.TAU2_TELECOM_EVAL_OUT?.trim();
+		if (!evalOut || client === undefined) return;
+		mkdirSync(dirname(evalOut), { recursive: true });
+		try {
+			const result = await client.request<Record<string, unknown>>("evaluate");
+			writeFileSync(evalOut, `${JSON.stringify(result, null, 2)}\n`);
+		} catch (error) {
+			writeFileSync(
+				evalOut,
+				`${JSON.stringify({ error: String(error), reward: 0.0 }, null, 2)}\n`,
+			);
+		}
+	};
+
 	pi.on("session_start", async (_event, ctx) => {
 		try {
 			await registerTelecomTools();
 			ctx.ui.notify(`Registered ${toolDescriptors.length} tau2 Telecom tools`, "info");
+			const taskId = process.env.TAU2_TELECOM_TASK_ID?.trim();
+			if (taskId) {
+				const autoPrompt = ["1", "true", "yes", "on"].includes(
+					(process.env.TAU2_TELECOM_AUTO_PROMPT ?? "").trim().toLowerCase(),
+				);
+				await loadTelecomTask(taskId, ctx, { sendPrompt: autoPrompt });
+			}
 		} catch (error) {
 			ctx.ui.notify(`Failed to start tau2 Telecom bridge: ${String(error)}`, "error");
 		}
 	});
 
 	pi.on("session_shutdown", async () => {
+		await writeEvaluation();
 		client?.stop();
 		client = undefined;
 		toolDescriptors = [];
@@ -286,35 +343,7 @@ export default function tau2TelecomExtension(pi: ExtensionAPI) {
 				return;
 			}
 			try {
-				await registerTelecomTools();
-				const loaded = await getClient().request<LoadedTask>("load_task", {
-					task_id: taskId,
-				});
-				const availableNames = new Set(pi.getAllTools().map((tool) => tool.name));
-				const selectedNames = selectToolNamesForTask(
-					loaded.task_id,
-					toolDescriptors,
-				);
-				const activeNames = selectedNames.filter((name) => availableNames.has(name));
-				if (activeNames.length !== selectedNames.length) {
-					const missingNames = selectedNames.filter(
-						(name) => !availableNames.has(name),
-					);
-					throw new Error(
-						`Selected Telecom tools are not registered: ${missingNames.join(", ")}`,
-					);
-				}
-				pi.setActiveTools(activeNames);
-				ctx.ui.notify(
-					`Activated ${activeNames.length}/${toolDescriptors.length} tau2 Telecom tools`,
-					"info",
-				);
-				pi.setSessionName(`telecom ${loaded.task_id}`);
-				pi.sendUserMessage(
-					`/skill:telecom-solo-support Task ID: ${loaded.task_id}\n` +
-						`Policy mode: ${loaded.policy_type}\n\n${loaded.ticket}`,
-					{ expandPromptTemplates: true },
-				);
+				await loadTelecomTask(taskId, ctx, { sendPrompt: true });
 			} catch (error) {
 				ctx.ui.notify(`Failed to load Telecom task: ${String(error)}`, "error");
 			}
