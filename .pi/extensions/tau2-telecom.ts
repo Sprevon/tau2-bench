@@ -1,11 +1,14 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { dirname, delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 
-const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const PROJECT_ROOT = resolve(
+	dirname(realpathSync(fileURLToPath(import.meta.url))),
+	"../..",
+);
 
 const TASK_TOOL_ALLOWLISTS: Readonly<Record<string, readonly string[]>> = {
 	"[mobile_data_issue]user_abroad_roaming_enabled_off[PERSONA:None]": [
