@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import selectors
 import subprocess
 import sys
 import time
@@ -100,11 +101,77 @@ def _select_tasks(split: str, task_ids: list[str] | None, max_tasks: int) -> lis
     return selected
 
 
-def _parse_pi_events(raw: str) -> dict[str, Any]:
+def _parse_pi_events(
+    raw: str,
+    *,
+    line_times: list[float | None] | None = None,
+    started_perf: float | None = None,
+) -> dict[str, Any]:
+    """Parse Pi JSON events and derive output-token timing metrics.
+
+    Pi's JSON protocol reports cumulative ``usage.output`` for each assistant
+    turn on ``message_update`` events.  When ``line_times`` is supplied,
+    increases in that counter are used to measure first-token latency and
+    decode speed.
+    Keeping this parser usable with a plain string preserves the old behavior
+    for callers that do not have streaming timestamps.
+    """
     tool_names: list[str] = []
     texts: list[str] = []
     events = 0
-    for line in raw.splitlines():
+    output_tokens = 0
+    turn_output_tokens = 0
+    turn_start_at: float | None = None
+    turn_first_output_at: float | None = None
+    turn_last_output_at: float | None = None
+    generation_seconds = 0.0
+    first_output_at: float | None = None
+    lines = raw.splitlines()
+    if line_times is None or len(line_times) != len(lines):
+        line_times = [None] * len(lines)
+
+    def output_from_usage(payload: dict[str, Any]) -> int | None:
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            value = usage.get("output")
+            if isinstance(value, (int, float)) and value >= 0:
+                return int(value)
+        message = payload.get("message")
+        if isinstance(message, dict):
+            usage = message.get("usage")
+            if isinstance(usage, dict):
+                value = usage.get("output")
+                if isinstance(value, (int, float)) and value >= 0:
+                    return int(value)
+        return None
+
+    def finish_turn() -> None:
+        nonlocal output_tokens, turn_output_tokens, generation_seconds
+        nonlocal turn_start_at, turn_first_output_at, turn_last_output_at
+        if turn_output_tokens <= 0:
+            turn_start_at = None
+            turn_first_output_at = None
+            turn_last_output_at = None
+            return
+        output_tokens += turn_output_tokens
+        if turn_first_output_at is not None and turn_last_output_at is not None:
+            duration = turn_last_output_at - turn_first_output_at
+            if (
+                duration <= 0
+                and turn_start_at is not None
+                and turn_last_output_at > turn_start_at
+            ):
+                # A short response may be emitted in one update, so use the
+                # assistant turn start when no inter-update interval exists.
+                duration = turn_last_output_at - turn_start_at
+            if duration > 0:
+                generation_seconds += duration
+        turn_output_tokens = 0
+        turn_start_at = None
+        turn_first_output_at = None
+        turn_last_output_at = None
+
+    for line, line_time in zip(lines, line_times):
         line = line.strip()
         if not line.startswith("{"):
             continue
@@ -115,22 +182,67 @@ def _parse_pi_events(raw: str) -> dict[str, Any]:
         if not isinstance(payload, dict):
             continue
         events += 1
+        observed_output = output_from_usage(payload)
+        if observed_output is not None:
+            if observed_output > turn_output_tokens and line_time is not None:
+                if first_output_at is None:
+                    first_output_at = line_time
+                turn_first_output_at = turn_first_output_at or line_time
+                turn_last_output_at = line_time
+            turn_output_tokens = max(turn_output_tokens, observed_output)
         event_type = payload.get("type")
+        if (
+            event_type == "message_start"
+            and line_time is not None
+        ):
+            message = payload.get("message")
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                if turn_output_tokens:
+                    finish_turn()
+                turn_start_at = line_time
         if event_type == "message_update":
             assistant = payload.get("assistantMessageEvent") or {}
             if assistant.get("type") == "toolcall_start" and assistant.get("toolName"):
                 tool_names.append(str(assistant["toolName"]))
         if event_type == "message_end":
             message = payload.get("message") or {}
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                finish_turn()
             content = message.get("content")
             if isinstance(content, list):
                 for item in content:
                     if isinstance(item, dict) and item.get("type") == "text":
                         texts.append(str(item.get("text") or ""))
+    finish_turn()
+    first_token_sec = (
+        first_output_at - started_perf
+        if first_output_at is not None and started_perf is not None
+        else None
+    )
+    output_generation_sec = generation_seconds or None
+    output_tokens_per_sec = (
+        output_tokens / output_generation_sec
+        if output_tokens > 0 and output_generation_sec and output_generation_sec > 0
+        else None
+    )
     return {
         "n_json_events": events,
         "pi_tool_names": tool_names,
         "final_text": texts[-1] if texts else "",
+        "output_tokens": output_tokens,
+        "time_to_first_token_sec": (
+            round(first_token_sec, 4) if first_token_sec is not None else None
+        ),
+        "output_generation_sec": (
+            round(output_generation_sec, 4)
+            if output_generation_sec is not None
+            else None
+        ),
+        "output_tokens_per_sec": (
+            round(output_tokens_per_sec, 3)
+            if output_tokens_per_sec is not None
+            else None
+        ),
     }
 
 
@@ -190,30 +302,89 @@ def _run_pi_task(
         prompt,
     ]
     started = time.time()
+    started_perf = time.perf_counter()
+    stdout_lines: list[str] = []
+    stdout_times: list[float] = []
+    stderr_chunks: list[str] = []
+    timed_out = False
+    returncode = 1
+    process: subprocess.Popen[bytes] | None = None
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=str(repo_root),
             env=env,
-            text=True,
-            capture_output=True,
-            timeout=args.timeout,
-            check=False,
+            text=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
         )
-        timed_out = False
-        returncode = completed.returncode
-        stdout = completed.stdout
-        stderr = completed.stderr
-    except subprocess.TimeoutExpired as exc:
+        assert process.stdout is not None
+        assert process.stderr is not None
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        stream_buffers: dict[str, bytes] = {"stdout": b"", "stderr": b""}
+        deadline = started_perf + args.timeout
+        kill_deadline: float | None = None
+        while selector.get_map():
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                if not timed_out:
+                    timed_out = True
+                    process.kill()
+                    kill_deadline = time.perf_counter() + 5.0
+                remaining = (kill_deadline or time.perf_counter()) - time.perf_counter()
+                if remaining <= 0:
+                    break
+            ready = selector.select(min(remaining, 0.25))
+            for key, _ in ready:
+                stream_name = key.data
+                read_chunk = getattr(key.fileobj, "read1", key.fileobj.read)
+                chunk = read_chunk(65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                stream_buffers[stream_name] += chunk
+                while b"\n" in stream_buffers[stream_name]:
+                    line, stream_buffers[stream_name] = stream_buffers[stream_name].split(
+                        b"\n", 1
+                    )
+                    decoded_line = line.decode("utf-8", errors="replace")
+                    if stream_name == "stdout":
+                        stdout_lines.append(decoded_line)
+                        stdout_times.append(time.perf_counter())
+                    else:
+                        stderr_chunks.append(decoded_line + "\n")
+            if timed_out and process.poll() is not None:
+                # The pipes will close shortly; continue draining them.
+                pass
+        for stream_name, remainder in stream_buffers.items():
+            if not remainder:
+                continue
+            if stream_name == "stdout":
+                stdout_lines.append(remainder.decode("utf-8", errors="replace"))
+                stdout_times.append(time.perf_counter())
+            else:
+                stderr_chunks.append(remainder.decode("utf-8", errors="replace"))
+        selector.close()
+        returncode = process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
         timed_out = True
         returncode = 124
-        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+    finally:
+        stdout = "\n".join(stdout_lines) + ("\n" if stdout_lines else "")
+        stderr = "".join(stderr_chunks)
     elapsed = time.time() - started
     stdout_path.write_text(stdout or "", encoding="utf-8")
     stderr_path.write_text(stderr or "", encoding="utf-8")
     eval_payload = _read_json(eval_path)
-    pi_events = _parse_pi_events(stdout or "")
+    pi_events = _parse_pi_events(
+        stdout or "", line_times=stdout_times, started_perf=started_perf
+    )
     error = None
     if timed_out:
         error = f"pi timed out after {args.timeout}s"
@@ -243,6 +414,10 @@ def _run_pi_task(
         "timed_out": timed_out,
         "final_text": pi_events["final_text"],
         "pi_tool_names": pi_events["pi_tool_names"],
+        "output_tokens": pi_events["output_tokens"],
+        "time_to_first_token_sec": pi_events["time_to_first_token_sec"],
+        "output_generation_sec": pi_events["output_generation_sec"],
+        "output_tokens_per_sec": pi_events["output_tokens_per_sec"],
         "eval": eval_payload,
     }
     (task_dir / "result.json").write_text(
@@ -284,6 +459,7 @@ def main() -> None:
                 f"[{args.model}] {index}/{len(tasks)} {task.id} "
                 f"reward={result['reward']} tools={result['n_tool_calls']} "
                 f"errors={result['n_tool_errors']} elapsed={result['elapsed_sec']}s "
+                f"output_tps={result['output_tokens_per_sec'] or 'n/a'} "
                 f"status={result['error'] or 'ok'}",
                 flush=True,
             )
@@ -301,6 +477,23 @@ def main() -> None:
         "mean_tool_calls": (
             sum(item["n_tool_calls"] for item in results) / len(results) if results else 0.0
         ),
+        "mean_output_tokens": (
+            sum(item["output_tokens"] for item in results) / len(results)
+            if results
+            else 0.0
+        ),
+        "mean_output_tokens_per_sec": (
+            sum(
+                item["output_tokens_per_sec"]
+                for item in results
+                if item["output_tokens_per_sec"] is not None
+            )
+            / sum(
+                1 for item in results if item["output_tokens_per_sec"] is not None
+            )
+            if any(item["output_tokens_per_sec"] is not None for item in results)
+            else None
+        ),
         "started_at": datetime.now(timezone.utc).isoformat(),
         "results": [
             {
@@ -311,6 +504,10 @@ def main() -> None:
                 "n_tool_calls": item["n_tool_calls"],
                 "n_tool_errors": item["n_tool_errors"],
                 "elapsed_sec": item["elapsed_sec"],
+                "output_tokens": item["output_tokens"],
+                "time_to_first_token_sec": item["time_to_first_token_sec"],
+                "output_generation_sec": item["output_generation_sec"],
+                "output_tokens_per_sec": item["output_tokens_per_sec"],
             }
             for item in results
         ],

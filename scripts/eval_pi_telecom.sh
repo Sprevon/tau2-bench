@@ -136,6 +136,8 @@ for path in sys.argv[2:]:
             "success_rate": payload.get("success_rate"),
             "n_errors": payload.get("n_errors"),
             "mean_tool_calls": payload.get("mean_tool_calls"),
+            "mean_output_tokens": payload.get("mean_output_tokens"),
+            "mean_output_tokens_per_sec": payload.get("mean_output_tokens_per_sec"),
             "summary_path": path,
         }
     )
