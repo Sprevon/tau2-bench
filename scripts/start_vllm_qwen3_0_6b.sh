@@ -59,6 +59,6 @@ exec "${TAU2_VLLM_BIN}" serve "${TAU2_VLLM_MODEL_PATH}" \
 	--gpu-memory-utilization "${TAU2_VLLM_GPU_MEMORY_UTILIZATION}" \
 	--generation-config vllm \
 	--enable-auto-tool-choice \
-	--tool-call-parser qwen3_xml \
+	--tool-call-parser hermes \
 	--reasoning-parser qwen3 \
 	"$@"
