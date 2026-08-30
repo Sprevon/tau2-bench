@@ -16,7 +16,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from tau2.domains.telecom.environment import get_tasks
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SRC = str(_REPO_ROOT / "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+
+from tau2.domains.telecom.environment import get_tasks  # noqa: E402
 
 DEFAULT_PROVIDER = "local-vllm"
 DEFAULT_THINKING = "medium"
@@ -243,7 +248,7 @@ def _run_pi_task(
 
 def main() -> None:
     args = _parse_args()
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = _REPO_ROOT
     if not args.skip_vllm_wait:
         wait_for_vllm(args.endpoint, args.vllm_wait)
 

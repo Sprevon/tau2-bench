@@ -18,6 +18,7 @@ if [[ ! -x "$TAU2_PYTHON" ]]; then
   TAU2_PYTHON="$(command -v python3 || command -v python)"
 fi
 export TAU2_PI_PYTHON="$TAU2_PYTHON"
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export PATH="${TAU2_ENV:-/root/autodl-tmp/envs/tau2}/bin:/root/autodl-tmp/envs/node-v22.19.0-linux-x64/bin:${PATH:-}"
 
 SPLIT="${TAU2_PI_SPLIT:-small}"
