@@ -18,6 +18,7 @@ if [[ ! -x "$TAU2_PYTHON" ]]; then
   TAU2_PYTHON="$(command -v python3 || command -v python)"
 fi
 export TAU2_PI_PYTHON="$TAU2_PYTHON"
+export PYTHONUNBUFFERED=1
 export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export PATH="${TAU2_ENV:-/root/autodl-tmp/envs/tau2}/bin:/root/autodl-tmp/envs/node-v22.19.0-linux-x64/bin:${PATH:-}"
 
@@ -109,7 +110,7 @@ for model in "${MODELS[@]}"; do
     start_vllm "$model" "${model_dir}/vllm.log"
   fi
   echo "Evaluating ${model}"
-  "$TAU2_PYTHON" "${python_args[@]}" --model "$model" --output-dir "$model_dir"
+  "$TAU2_PYTHON" -u "${python_args[@]}" --model "$model" --output-dir "$model_dir"
   summaries+=("${model_dir}/summary.json")
   if [[ "$SKIP_VLLM" != "1" ]]; then
     stop_vllm

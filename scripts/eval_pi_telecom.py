@@ -16,6 +16,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SRC = str(_REPO_ROOT / "src")
 if _SRC not in sys.path:
@@ -255,8 +261,8 @@ def main() -> None:
     tasks = _select_tasks(args.split, args.task_ids, args.max_tasks)
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"model={args.model} split={args.split} n_tasks={len(tasks)}")
-    print(f"thinking={args.thinking} output={output_dir}")
+    print(f"model={args.model} split={args.split} n_tasks={len(tasks)}", flush=True)
+    print(f"thinking={args.thinking} output={output_dir}", flush=True)
 
     results: list[dict[str, Any]] = []
     traces_path = output_dir / "results.jsonl"
@@ -264,7 +270,7 @@ def main() -> None:
         for index, task in enumerate(tasks, 1):
             slug = _task_slug(task.id, index)
             task_dir = output_dir / "tasks" / slug
-            print(f"\n==== {index}/{len(tasks)} {task.id} ====")
+            print(f"\n==== {index}/{len(tasks)} {task.id} ====", flush=True)
             result = _run_pi_task(
                 task=task,
                 args=args,
@@ -275,9 +281,11 @@ def main() -> None:
             handle.write(json.dumps(result, ensure_ascii=False) + "\n")
             handle.flush()
             print(
+                f"[{args.model}] {index}/{len(tasks)} {task.id} "
                 f"reward={result['reward']} tools={result['n_tool_calls']} "
                 f"errors={result['n_tool_errors']} elapsed={result['elapsed_sec']}s "
-                f"status={result['error'] or 'ok'}"
+                f"status={result['error'] or 'ok'}",
+                flush=True,
             )
 
     n_success = sum(1 for item in results if item["success"])
@@ -312,8 +320,8 @@ def main() -> None:
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    print(f"\nwrote {traces_path}")
-    print(f"wrote {summary_path}")
+    print(f"\nwrote {traces_path}", flush=True)
+    print(f"wrote {summary_path}", flush=True)
     print(
         json.dumps(
             {
@@ -322,7 +330,8 @@ def main() -> None:
                 "success_rate": summary["success_rate"],
             },
             ensure_ascii=False,
-        )
+        ),
+        flush=True,
     )
 
 
