@@ -7,6 +7,16 @@ import type { TSchema } from "typebox";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
+const TASK_TOOL_ALLOWLISTS: Readonly<Record<string, readonly string[]>> = {
+	"[mobile_data_issue]user_abroad_roaming_enabled_off[PERSONA:None]": [
+		"get_customer_by_phone",
+		"check_status_bar",
+		"check_network_status",
+		"toggle_roaming",
+		"run_speed_test",
+	],
+};
+
 interface ToolDescriptor {
 	name: string;
 	description: string;
@@ -58,6 +68,25 @@ function labelFor(name: string): string {
 		.split("_")
 		.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
 		.join(" ");
+}
+
+function selectToolNamesForTask(
+	taskId: string,
+	descriptors: ToolDescriptor[],
+): string[] {
+	const allowlist = TASK_TOOL_ALLOWLISTS[taskId];
+	if (allowlist === undefined) {
+		return descriptors.map((descriptor) => descriptor.name);
+	}
+
+	const describedNames = new Set(descriptors.map((descriptor) => descriptor.name));
+	const missingNames = allowlist.filter((name) => !describedNames.has(name));
+	if (missingNames.length > 0) {
+		throw new Error(
+			`Task tool allowlist references unavailable tools: ${missingNames.join(", ")}`,
+		);
+	}
+	return [...allowlist];
 }
 
 class TelecomBridgeClient {
@@ -259,10 +288,24 @@ export default function tau2TelecomExtension(pi: ExtensionAPI) {
 					task_id: taskId,
 				});
 				const availableNames = new Set(pi.getAllTools().map((tool) => tool.name));
-				const activeNames = toolDescriptors.map((tool) => tool.name).filter((name) =>
-					availableNames.has(name),
+				const selectedNames = selectToolNamesForTask(
+					loaded.task_id,
+					toolDescriptors,
 				);
+				const activeNames = selectedNames.filter((name) => availableNames.has(name));
+				if (activeNames.length !== selectedNames.length) {
+					const missingNames = selectedNames.filter(
+						(name) => !availableNames.has(name),
+					);
+					throw new Error(
+						`Selected Telecom tools are not registered: ${missingNames.join(", ")}`,
+					);
+				}
 				pi.setActiveTools(activeNames);
+				ctx.ui.notify(
+					`Activated ${activeNames.length}/${toolDescriptors.length} tau2 Telecom tools`,
+					"info",
+				);
 				pi.setSessionName(`telecom ${loaded.task_id}`);
 				pi.sendUserMessage(
 					`/skill:telecom-solo-support Task ID: ${loaded.task_id}\n` +
