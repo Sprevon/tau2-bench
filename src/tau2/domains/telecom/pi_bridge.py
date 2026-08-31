@@ -12,7 +12,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
-from tau2.data_model.message import ToolCall
+from tau2.data_model.message import AssistantMessage, ToolCall
 from tau2.data_model.simulation import DBCheck, EnvAssertionCheck, RewardInfo
 from tau2.data_model.tasks import RewardType, Task
 from tau2.domains.telecom.environment import (
@@ -22,6 +22,9 @@ from tau2.domains.telecom.environment import (
 )
 from tau2.environment.tool import Tool
 from tau2.environment.toolkit import ToolKitBase
+from tau2.environment.toolkit import get_tool_types
+from tau2.evaluator.evaluator_action import ActionEvaluator
+from tau2.evaluator.evaluator_communicate import CommunicateEvaluator
 
 
 @dataclass(frozen=True)
@@ -54,6 +57,7 @@ class TelecomPiBridge:
         self._tasks: dict[str, Task] | None = None
         self.task: Task | None = None
         self.tool_calls: list[dict[str, Any]] = []
+        self.assistant_texts: list[str] = []
 
     @property
     def tasks(self) -> dict[str, Task]:
@@ -123,12 +127,22 @@ class TelecomPiBridge:
         self.environment = environment
         self.task = task
         self.tool_calls = []
+        self.assistant_texts = []
         return {
             "task_id": task.id,
             "ticket": task.ticket,
             "policy_type": "workflow",
             "tool_count": len(self.describe_tools()),
         }
+
+    def record_assistant_text(self, content: str) -> dict[str, Any]:
+        """Record a final assistant message for communication evaluation."""
+        if self.task is None:
+            raise ValueError("No telecom task loaded. Run /telecom-task <task-id> first.")
+        normalized = content.strip()
+        if normalized:
+            self.assistant_texts.append(normalized)
+        return {"recorded": bool(normalized), "task_id": self.task.id}
 
     def call_tool(
         self,
@@ -189,7 +203,7 @@ class TelecomPiBridge:
         }
 
     def evaluate(self) -> dict[str, Any]:
-        """Score the live solo environment with tau2 ENV_ASSERTION / DB checks."""
+        """Score the live solo environment with the official reward components."""
         if self.task is None:
             raise ValueError("No telecom task loaded. Run /telecom-task <task-id> first.")
 
@@ -239,17 +253,67 @@ class TelecomPiBridge:
         reward = 1.0
         reward_breakdown: dict[RewardType, float] = {}
         basis = criteria.reward_basis or []
+
+        trajectory = [
+            AssistantMessage(
+                role="assistant",
+                tool_calls=[
+                    ToolCall(
+                        id=call["tool_call_id"],
+                        name=call["tool_name"],
+                        arguments=call["arguments"],
+                        requestor="assistant",
+                    )
+                ],
+            )
+            for call in self.tool_calls
+        ]
+        trajectory.extend(
+            AssistantMessage(role="assistant", content=content)
+            for content in self.assistant_texts
+        )
+        tool_types = get_tool_types(self.environment.tools)
+        if self.environment.user_tools is not None:
+            tool_types.update(get_tool_types(self.environment.user_tools))
+        action_info = ActionEvaluator.calculate_reward(
+            task=task,
+            full_trajectory=trajectory,
+            tool_types=tool_types,
+        )
+        communicate_info = CommunicateEvaluator.calculate_reward(
+            task=task,
+            full_trajectory=trajectory,
+        )
+
         if RewardType.DB in basis:
             reward_breakdown[RewardType.DB] = db_reward
             reward *= db_reward
         if RewardType.ENV_ASSERTION in basis:
             reward_breakdown[RewardType.ENV_ASSERTION] = env_assertion_reward
             reward *= env_assertion_reward
+        if RewardType.ACTION in basis:
+            reward_breakdown[RewardType.ACTION] = action_info.reward
+            reward *= action_info.reward
+        if RewardType.COMMUNICATE in basis:
+            reward_breakdown[RewardType.COMMUNICATE] = communicate_info.reward
+            reward *= communicate_info.reward
+        unsupported = set(basis) - {
+            RewardType.DB,
+            RewardType.ENV_ASSERTION,
+            RewardType.ACTION,
+            RewardType.COMMUNICATE,
+        }
+        if unsupported:
+            raise ValueError(
+                f"Pi Telecom bridge cannot evaluate reward bases: {sorted(item.value for item in unsupported)}"
+            )
 
         reward_info = RewardInfo(
             reward=reward,
             db_check=db_check,
             env_assertions=env_assertion_checks,
+            action_checks=action_info.action_checks,
+            communicate_checks=communicate_info.communicate_checks,
             reward_basis=basis,
             reward_breakdown=reward_breakdown,
         )
@@ -265,6 +329,7 @@ class TelecomPiBridge:
                 "n_tool_calls": len(self.tool_calls),
                 "n_tool_errors": n_errors,
                 "tool_calls": self.tool_calls,
+                "assistant_texts": self.assistant_texts,
             }
         )
         return payload
@@ -284,6 +349,8 @@ class TelecomPiBridge:
                 tool_name=str(params["tool_name"]),
                 arguments=arguments,
             )
+        if method == "record_assistant_text":
+            return self.record_assistant_text(content=str(params.get("content", "")))
         if method == "status":
             return self.status()
         if method == "list_tasks":
