@@ -643,7 +643,8 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
                 )
                 self.trajectory = [first_message]
                 self.message = first_message
-                # In solo mode, there is no user, so if the message is not a tool call, then we end and report an agent error
+                # In solo mode a plain assistant message is a valid terminal
+                # customer-facing response; preserve it for communication scoring.
                 if not first_message.is_tool_call():
                     self.from_role = Role.AGENT
                     self.to_role = Role.USER
@@ -652,7 +653,7 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
                         # If the agent is stopping (###STOP###)
                         self.termination_reason = TerminationReason.AGENT_STOP
                     else:
-                        self.termination_reason = TerminationReason.AGENT_ERROR
+                        self.termination_reason = TerminationReason.AGENT_STOP
                 else:
                     self.from_role = Role.AGENT
                     self.to_role = Role.ENV
