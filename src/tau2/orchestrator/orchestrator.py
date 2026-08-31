@@ -698,7 +698,8 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
         Validates that messages follow the communication rules:
         1. Messages must have either text content OR tool calls, not both
         2. Messages cannot be empty (no text content and no tool calls)
-        3. In solo mode, agents can only send tool calls (except for stop messages)
+        3. In solo mode, agents send tool calls until a final text response completes
+           the task; no user turn is generated.
 
         Raises:
             AgentError: When the agent violates communication rules
@@ -724,12 +725,8 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
                 f"{self.from_role.value} sent both text content and tool calls. {self.message}"
             )
 
-        # Check if the agent is allowed to send a message to the user
-        if self.from_role == Role.AGENT and self.solo_mode:
-            if self.message.has_text_content() and not self.agent.is_stop(self.message):
-                raise exception_type(
-                    f"{self.from_role.value} can only send tool calls. {self.message}"
-                )
+        # In solo mode plain assistant text is the terminal customer-facing
+        # response.  It is intentionally preserved for communication scoring.
 
     def _check_termination(self) -> None:
         """
