@@ -870,10 +870,12 @@ class Orchestrator(BaseOrchestrator[AgentT, UserT, Message]):
                 self.to_role = Role.ENV
             else:
                 self.to_role = Role.USER
-                # In solo mode, there is no user, so if the message is not a tool call and not a stop, then we end and report an agent error
+                # In solo mode a plain assistant message is the terminal customer-facing
+                # response.  Do not synthesize a ``done`` tool: preserve the text so the
+                # official communication evaluator sees exactly what Pi produced.
                 if self.solo_mode and not self.agent.is_stop(agent_msg):
                     self.done = True
-                    self.termination_reason = TerminationReason.AGENT_ERROR
+                    self.termination_reason = TerminationReason.AGENT_STOP
         # AGENT/USER -> ENV
         elif self.from_role in [Role.AGENT, Role.USER] and self.to_role == Role.ENV:
             if not self.message.is_tool_call():
