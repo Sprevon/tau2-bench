@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -10,15 +10,13 @@ const PROJECT_ROOT = resolve(
 	"../..",
 );
 
-const TASK_TOOL_ALLOWLISTS: Readonly<Record<string, readonly string[]>> = {
-	"[mobile_data_issue]user_abroad_roaming_enabled_off[PERSONA:None]": [
-		"get_customer_by_phone",
-		"check_status_bar",
-		"check_network_status",
-		"toggle_roaming",
-		"run_speed_test",
-	],
-};
+const TASK_TOOL_ALLOWLISTS: Readonly<Record<string, readonly string[]>> = JSON.parse(
+	readFileSync(join(PROJECT_ROOT, ".pi", "task_tool_allowlists.json"), "utf8"),
+);
+
+export function getTaskToolAllowlist(taskId: string): readonly string[] | undefined {
+	return TASK_TOOL_ALLOWLISTS[taskId];
+}
 
 interface ToolDescriptor {
 	name: string;
@@ -109,7 +107,7 @@ function selectToolNamesForTask(
 	taskId: string,
 	descriptors: ToolDescriptor[],
 ): string[] {
-	const allowlist = TASK_TOOL_ALLOWLISTS[taskId];
+	const allowlist = getTaskToolAllowlist(taskId);
 	if (allowlist === undefined) {
 		return descriptors.map((descriptor) => descriptor.name);
 	}

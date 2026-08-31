@@ -1,0 +1,9 @@
+{
+  "[mobile_data_issue]user_abroad_roaming_enabled_off[PERSONA:None]": [
+    "get_customer_by_phone",
+    "check_status_bar",
+    "check_network_status",
+    "toggle_roaming",
+    "run_speed_test"
+  ]
+}
