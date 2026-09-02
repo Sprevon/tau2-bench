@@ -283,52 +283,52 @@ export function createTau2TelecomExtension(
 	};
 
 	const extension = (pi: ExtensionAPI): void => {
-	const registerTelecomTools = async (): Promise<void> => {
-		if (toolDescriptors.length === 0) {
-			toolDescriptors = await getClient().request<ToolDescriptor[]>("describe_tools");
-		}
-		for (const descriptor of toolDescriptors) {
-			if (registeredNames.has(descriptor.name)) continue;
-			registeredNames.add(descriptor.name);
-			pi.registerTool({
-				name: descriptor.name,
-				label: labelFor(descriptor.name),
-				description: descriptor.description,
-				parameters: descriptor.parameters as TSchema,
-				executionMode: "sequential",
-				async execute(toolCallId, params, signal) {
-					if (signal?.aborted) {
+		const registerTelecomTools = async (): Promise<void> => {
+			if (toolDescriptors.length === 0) {
+				toolDescriptors = await getClient().request<ToolDescriptor[]>("describe_tools");
+			}
+			for (const descriptor of toolDescriptors) {
+				if (registeredNames.has(descriptor.name)) continue;
+				registeredNames.add(descriptor.name);
+				pi.registerTool({
+					name: descriptor.name,
+					label: labelFor(descriptor.name),
+					description: descriptor.description,
+					parameters: descriptor.parameters as TSchema,
+					executionMode: "sequential",
+					async execute(toolCallId, params, signal) {
+						if (signal?.aborted) {
+							return {
+								content: [{ type: "text", text: "Cancelled" }],
+								details: { cancelled: true },
+							};
+						}
+						const argumentsObject = isRecord(params) ? params : {};
+						const result = await getClient().request<ToolCallResult>("call_tool", {
+							tool_call_id: toolCallId,
+							tool_name: descriptor.name,
+							arguments: argumentsObject,
+						});
+						await options.onToolResult?.(result);
 						return {
-							content: [{ type: "text", text: "Cancelled" }],
-							details: { cancelled: true },
+							content: [{ type: "text", text: result.content }],
+							details: {
+								error: result.error,
+								source: descriptor.source,
+								toolType: descriptor.tool_type,
+								mutatesState: descriptor.mutates_state,
+								taskId: result.task_id,
+							},
 						};
-					}
-					const argumentsObject = isRecord(params) ? params : {};
-					const result = await getClient().request<ToolCallResult>("call_tool", {
-						tool_call_id: toolCallId,
-						tool_name: descriptor.name,
-						arguments: argumentsObject,
-					});
-					await options.onToolResult?.(result);
-					return {
-						content: [{ type: "text", text: result.content }],
-						details: {
-							error: result.error,
-							source: descriptor.source,
-							toolType: descriptor.tool_type,
-							mutatesState: descriptor.mutates_state,
-							taskId: result.task_id,
-						},
-					};
-				},
-			});
-		}
-	};
+					},
+				});
+			}
+		};
 
 	const loadTelecomTask = async (
 		taskId: string,
 		ctx: { ui: { notify: (message: string, type?: "info" | "warning" | "error") => void } },
-		options: { sendPrompt: boolean },
+		loadOptions: { sendPrompt: boolean },
 	): Promise<LoadedTelecomTask> => {
 		await registerTelecomTools();
 		const loaded = await getClient().request<LoadedTelecomTask>("load_task", {
@@ -351,7 +351,7 @@ export function createTau2TelecomExtension(
 			"info",
 		);
 		pi.setSessionName(`telecom ${loaded.task_id}`);
-		if (options.sendPrompt) {
+		if (loadOptions.sendPrompt) {
 			pi.sendUserMessage(formatTelecomTaskPrompt(loaded), {
 				expandPromptTemplates: true,
 			});
@@ -362,16 +362,19 @@ export function createTau2TelecomExtension(
 
 	const writeEvaluation = async (): Promise<void> => {
 		const evalOut = process.env.TAU2_TELECOM_EVAL_OUT?.trim();
-		if (!evalOut || client === undefined) return;
-		mkdirSync(dirname(evalOut), { recursive: true });
+		if ((!evalOut && options.onEvaluation === undefined) || client === undefined) return;
+		if (evalOut) mkdirSync(dirname(evalOut), { recursive: true });
 		try {
 			const result = await evaluate();
-			writeFileSync(evalOut, `${JSON.stringify(result, null, 2)}\n`);
+			if (evalOut) writeFileSync(evalOut, `${JSON.stringify(result, null, 2)}\n`);
 		} catch (error) {
-			writeFileSync(
-				evalOut,
-				`${JSON.stringify({ error: String(error), reward: 0.0 }, null, 2)}\n`,
-			);
+			if (evalOut) {
+				writeFileSync(
+					evalOut,
+					`${JSON.stringify({ error: String(error), reward: 0.0 }, null, 2)}\n`,
+				);
+			}
+			if (options.onEvaluation !== undefined) throw error;
 		}
 	};
 
@@ -379,13 +382,13 @@ export function createTau2TelecomExtension(
 		try {
 			await registerTelecomTools();
 			ctx.ui.notify(`Registered ${toolDescriptors.length} tau2 Telecom tools`, "info");
-				const taskId = options.taskId?.trim() || process.env.TAU2_TELECOM_TASK_ID?.trim();
-				if (taskId) {
-					const autoPrompt =
-						options.autoPrompt ??
-						["1", "true", "yes", "on"].includes(
-							(process.env.TAU2_TELECOM_AUTO_PROMPT ?? "").trim().toLowerCase(),
-						);
+			const taskId = options.taskId?.trim() || process.env.TAU2_TELECOM_TASK_ID?.trim();
+			if (taskId) {
+				const autoPrompt =
+					options.autoPrompt ??
+					["1", "true", "yes", "on"].includes(
+						(process.env.TAU2_TELECOM_AUTO_PROMPT ?? "").trim().toLowerCase(),
+					);
 				await loadTelecomTask(taskId, ctx, { sendPrompt: autoPrompt });
 			}
 		} catch (error) {
@@ -395,13 +398,16 @@ export function createTau2TelecomExtension(
 	});
 
 	pi.on("session_shutdown", async () => {
-		await writeEvaluation();
-		client?.stop();
-		client = undefined;
-		toolDescriptors = [];
-		registeredNames.clear();
-		loadedTaskId = null;
-		activeToolNames = [];
+		try {
+			await writeEvaluation();
+		} finally {
+			client?.stop();
+			client = undefined;
+			toolDescriptors = [];
+			registeredNames.clear();
+			loadedTaskId = null;
+			activeToolNames = [];
+		}
 	});
 
 	pi.on("agent_end", async (event) => {
