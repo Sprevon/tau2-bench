@@ -27,7 +27,7 @@ interface ToolDescriptor {
 	mutates_state: boolean;
 }
 
-interface LoadedTask {
+export interface LoadedTelecomTask {
 	task_id: string;
 	ticket: string;
 	policy_type: "workflow";
@@ -64,7 +64,11 @@ export interface TelecomExtensionSnapshot {
 export interface TelecomExtensionOptions {
 	taskId?: string;
 	autoPrompt?: boolean;
-	onTaskLoaded?: (task: LoadedTask, snapshot: TelecomExtensionSnapshot) => void | Promise<void>;
+	failFastOnStartError?: boolean;
+	onTaskLoaded?: (
+		task: LoadedTelecomTask,
+		snapshot: TelecomExtensionSnapshot,
+	) => void | Promise<void>;
 	onToolResult?: (result: ToolCallResult) => void | Promise<void>;
 	onEvaluation?: (result: Record<string, unknown>) => void | Promise<void>;
 }
@@ -101,6 +105,15 @@ function labelFor(name: string): string {
 		.split("_")
 		.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
 		.join(" ");
+}
+
+export function formatTelecomTaskPrompt(
+	task: Pick<LoadedTelecomTask, "task_id" | "policy_type" | "ticket">,
+): string {
+	return (
+		`/skill:telecom-solo-support Task ID: ${task.task_id}\n` +
+		`Policy mode: ${task.policy_type}\n\n${task.ticket}`
+	);
 }
 
 function selectToolNamesForTask(
@@ -316,38 +329,36 @@ export function createTau2TelecomExtension(
 		taskId: string,
 		ctx: { ui: { notify: (message: string, type?: "info" | "warning" | "error") => void } },
 		options: { sendPrompt: boolean },
-	): Promise<LoadedTask> => {
+	): Promise<LoadedTelecomTask> => {
 		await registerTelecomTools();
-		const loaded = await getClient().request<LoadedTask>("load_task", {
+		const loaded = await getClient().request<LoadedTelecomTask>("load_task", {
 			task_id: taskId,
 		});
 		const availableNames = new Set(pi.getAllTools().map((tool) => tool.name));
 		const selectedNames = selectToolNamesForTask(loaded.task_id, toolDescriptors);
-			const activeNames = selectedNames.filter((name) => availableNames.has(name));
+		const activeNames = selectedNames.filter((name) => availableNames.has(name));
 		if (activeNames.length !== selectedNames.length) {
 			const missingNames = selectedNames.filter((name) => !availableNames.has(name));
 			throw new Error(
 				`Selected Telecom tools are not registered: ${missingNames.join(", ")}`,
 			);
 		}
-			pi.setActiveTools(activeNames);
-			activeToolNames = [...activeNames];
-			loadedTaskId = loaded.task_id;
+		pi.setActiveTools(activeNames);
+		activeToolNames = [...activeNames];
+		loadedTaskId = loaded.task_id;
 		ctx.ui.notify(
 			`Activated ${activeNames.length}/${toolDescriptors.length} tau2 Telecom tools`,
 			"info",
 		);
 		pi.setSessionName(`telecom ${loaded.task_id}`);
-			if (options.sendPrompt) {
-			pi.sendUserMessage(
-				`/skill:telecom-solo-support Task ID: ${loaded.task_id}\n` +
-					`Policy mode: ${loaded.policy_type}\n\n${loaded.ticket}`,
-				{ expandPromptTemplates: true },
-			);
-			}
-			await options.onTaskLoaded?.(loaded, getSnapshot());
-			return loaded;
-		};
+		if (options.sendPrompt) {
+			pi.sendUserMessage(formatTelecomTaskPrompt(loaded), {
+				expandPromptTemplates: true,
+			});
+		}
+		await options.onTaskLoaded?.(loaded, getSnapshot());
+		return loaded;
+	};
 
 	const writeEvaluation = async (): Promise<void> => {
 		const evalOut = process.env.TAU2_TELECOM_EVAL_OUT?.trim();
@@ -379,6 +390,7 @@ export function createTau2TelecomExtension(
 			}
 		} catch (error) {
 			ctx.ui.notify(`Failed to start tau2 Telecom bridge: ${String(error)}`, "error");
+			if (options.failFastOnStartError) throw error;
 		}
 	});
 
